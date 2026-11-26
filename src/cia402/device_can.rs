@@ -38,17 +38,12 @@ const OBJECT_2100_IDENTITIES: &[(u32, u32)] = &[
     (0x6865_786D, 0x006C_6674),
 ];
 
-const OBJECT_2100_IMU_IDENTITIES: &[(u32, u32)] = &[
-    (0x6865_786D, 0x0069_6D75),
-    (0x6865_786D, 0x6169_6D75),
-];
+const OBJECT_2100_IMU_IDENTITIES: &[(u32, u32)] =
+    &[(0x6865_786D, 0x0069_6D75), (0x6865_786D, 0x6169_6D75)];
 
 const OBJECT_2100_LIFT_IDENTITY: (u32, u32) = (0x6865_786D, 0x006C_6674);
 
-pub(crate) fn dialect_for_tuple(
-    vendor_id: u32,
-    product_code: u32,
-) -> Option<CanConfigDialect> {
+pub(crate) fn dialect_for_tuple(vendor_id: u32, product_code: u32) -> Option<CanConfigDialect> {
     let key = (vendor_id, product_code);
     if OBJECT_2001_IDENTITIES.contains(&key) {
         Some(CanConfigDialect::Object2001)
@@ -163,8 +158,9 @@ pub(crate) async fn read_device_settings_snapshot(
     product_code: u32,
     sdo_timeout: Duration,
 ) -> std::result::Result<DeviceSettingsSnapshot, String> {
-    let dialect = dialect_for_tuple(vendor_id, product_code)
-        .ok_or_else(|| "the exact vendor/product tuple has no supported settings dialect".to_string())?;
+    let dialect = dialect_for_tuple(vendor_id, product_code).ok_or_else(|| {
+        "the exact vendor/product tuple has no supported settings dialect".to_string()
+    })?;
     let timeout = Some(sdo_timeout);
     let config = match dialect {
         CanConfigDialect::Object2001 => read_object_2001(bus, nid, timeout).await?,
@@ -549,12 +545,8 @@ mod tests {
 
     #[test]
     fn unchanged_object_2001_plan_retries_store_without_reporting_field_changes() {
-        let current = settings_snapshot(
-            CanConfigDialect::Object2001,
-            8,
-            Some(4_000_000),
-            Some(true),
-        );
+        let current =
+            settings_snapshot(CanConfigDialect::Object2001, 8, Some(4_000_000), Some(true));
         let plan = build_device_settings_plan(
             &current,
             DeviceSettingsUpdate {
@@ -566,10 +558,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            plan.writes,
-            vec![SdoWrite::u32(0x1010, 1, 0x6576_6173)]
-        );
+        assert_eq!(plan.writes, vec![SdoWrite::u32(0x1010, 1, 0x6576_6173)]);
         assert!(!plan.result.changed);
         assert!(plan.result.restart_required);
     }
@@ -832,10 +821,7 @@ mod tests {
                 transmit_pdo_brs: None,
             })
         );
-        assert_eq!(
-            bus.requests(),
-            vec![(0x2100, 0), (0x2101, 0), (0x2100, 1)]
-        );
+        assert_eq!(bus.requests(), vec![(0x2100, 0), (0x2101, 0), (0x2100, 1)]);
     }
 
     #[tokio::test]

@@ -212,8 +212,8 @@ mod tests {
     fn device_tpdo1_is_exactly_eight_bytes_at_every_rate() {
         // 载荷宽度与节拍无关：降频只改通信参数，不改映射，否则解码器要跟着变。
         for ms in [1u16, 2, 4] {
-            let recipe = device_tpdo1_recipe(10, PdoProfile::from_event_timer_ms(ms).unwrap())
-                .unwrap();
+            let recipe =
+                device_tpdo1_recipe(10, PdoProfile::from_event_timer_ms(ms).unwrap()).unwrap();
             assert_eq!(recipe.total_bytes(), 8, "payload width @ {ms}ms");
             assert_eq!(recipe.entries, TPDO1_ENTRIES);
             assert_eq!(recipe.comm.event_timer_ms, ms);

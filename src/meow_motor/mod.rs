@@ -38,7 +38,8 @@ pub use identity::{
     PRODUCT_CODE_4342, VENDOR_ID,
 };
 pub use manager::{
-    MeowMotorInitializeOptions, MeowMotorManager, MeowMotorManagerOptions, SharedHostPdoConfig,
+    MeowMotorInitializeOptions, MeowMotorInitializeTarget, MeowMotorManager,
+    MeowMotorManagerOptions, SharedHostPdoConfig,
 };
 // The 64-bit packer is protocol-neutral.  Re-exporting it here keeps the new
 // object's address/initialization separate while preserving the established

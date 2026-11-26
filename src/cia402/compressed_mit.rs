@@ -5,7 +5,7 @@
 //! (pos 16-bit + vel/tor/kp/kd 各 12-bit),6 个电机 48B 可塞进一帧 BRS CAN-FD。
 //!
 //! 用法(与 [`crate::cia402::Cia402Manager`] 配合):
-//!   1. `mgr.initialize(nid)`:NMT Operational + 心跳监听 + 默认 TPDO 反馈(q/dq/τ)。
+//!   1. `mgr.initialize([nid])` 成功后，节点进入 NMT Operational 并提供默认 TPDO 反馈(q/dq/τ)。
 //!   2. 每个电机调 [`configure`]:写 `0x2004` 压缩开关/映射范围 + 把 RPDO1 重映射到
 //!      `0x2004:02/03`(本电机在共享帧里的 8 字节槽)+ 进 MIT 模式 + 使能。
 //!   3. 控制环按节拍构造共享帧([`pack_shared_frame`])经 `bus.send` 发到 [`DEFAULT_SHARED_COB_ID`]。
@@ -36,7 +36,11 @@ const SUB_KP_KD_TORQUE_PERMILLE: u8 = 0x0E; // u16: MIT KP/KD 项最大力矩(�
 const MODE_MIT: i8 = 5;
 
 /// 占位对象:其他电机槽的 8 字节由它消费(本电机不关心)。沿用参考实现的 `0x3000:03`。
-const PLACEHOLDER: TpdoEntry = TpdoEntry { index: 0x3000, subindex: 0x03, bit_len: 32 };
+const PLACEHOLDER: TpdoEntry = TpdoEntry {
+    index: 0x3000,
+    subindex: 0x03,
+    bit_len: 32,
+};
 
 /// 主站发命令用的共享 COB-ID(= 主站 node 0x10 的 TPDO1 功能码 0x180 | 0x10)。
 /// 所有电机的 RPDO1 都监听它,各取自己的 8 字节槽。
@@ -97,8 +101,13 @@ pub struct CompressedMitTarget {
 
 impl CompressedMitTarget {
     /// 零目标(kp=kd=0 → 零力矩;注意定点对 0 有 ~±数 mNm 量化偏差,见模块说明)。
-    pub const ZERO: Self =
-        Self { position: 0.0, velocity: 0.0, torque: 0.0, kp: 0.0, kd: 0.0 };
+    pub const ZERO: Self = Self {
+        position: 0.0,
+        velocity: 0.0,
+        torque: 0.0,
+        kp: 0.0,
+        kd: 0.0,
+    };
 
     fn float_to_uint(x: f32, x_min: f32, x_max: f32, bits: u32) -> u32 {
         let x = x.clamp(x_min, x_max);
@@ -143,8 +152,16 @@ fn rpdo_entries(slice: u8, total: u8) -> Vec<TpdoEntry> {
     let mut entries = Vec::with_capacity(2 * total as usize);
     for i in 0..total {
         if i == slice {
-            entries.push(TpdoEntry { index: OD_MIT_COMPRESSED, subindex: SUB_LOWER, bit_len: 32 });
-            entries.push(TpdoEntry { index: OD_MIT_COMPRESSED, subindex: SUB_UPPER, bit_len: 32 });
+            entries.push(TpdoEntry {
+                index: OD_MIT_COMPRESSED,
+                subindex: SUB_LOWER,
+                bit_len: 32,
+            });
+            entries.push(TpdoEntry {
+                index: OD_MIT_COMPRESSED,
+                subindex: SUB_UPPER,
+                bit_len: 32,
+            });
         } else {
             entries.push(PLACEHOLDER);
             entries.push(PLACEHOLDER);
@@ -153,8 +170,8 @@ fn rpdo_entries(slice: u8, total: u8) -> Vec<TpdoEntry> {
     entries
 }
 
-/// 配置一个电机进入压缩 MIT(**前提:`Cia402Manager::initialize(nid)` 已跑过** ——
-/// NMT Operational / 心跳监听 / 默认 TPDO 反馈已就绪)。
+/// 配置一台电机进入压缩 MIT 模式。调用前应确认 `manager.initialize([nid])` 对该节点返回成功，
+/// 此时节点已进入 NMT Operational，心跳监听和默认 TPDO 反馈均已就绪。
 ///
 /// 顺序:最大力矩限制 → `0x2004` 映射范围/初值/压缩开关 → 短接制动 → RPDO1 重映射到本槽
 /// → MIT 模式 → 使能(控制字 6→7→0x0F)。完成后电机已使能,**调用方须立即按节拍发共享帧**
@@ -212,7 +229,15 @@ where
     // 1) 最大力矩限制(全模式 + MIT KP/KD 项)
     sdo::download_u16(bus, nid, OD_MAX_TORQUE, 0, torque_permille, timeout).await?;
     gap().await;
-    sdo::download_u16(bus, nid, OD_MIT_COMPRESSED, SUB_KP_KD_TORQUE_PERMILLE, kp_kd_torque_permille, timeout).await?;
+    sdo::download_u16(
+        bus,
+        nid,
+        OD_MIT_COMPRESSED,
+        SUB_KP_KD_TORQUE_PERMILLE,
+        kp_kd_torque_permille,
+        timeout,
+    )
+    .await?;
     gap().await;
 
     // 2) 映射范围 0x2004:04..0D(f32)

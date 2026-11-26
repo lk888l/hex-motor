@@ -176,10 +176,12 @@ async fn main() -> anyhow::Result<()> {
             info.can_settings
         );
 
-        let mut initialize = MeowMotorInitializeOptions::new(tpdo1_rate);
-        initialize.configure_consumer_heartbeat = action.enables_motion();
+        let mut options = MeowMotorInitializeOptions::new(tpdo1_rate);
+        options.configure_consumer_heartbeat = action.enables_motion();
         initialization_started.store(true, Ordering::Release);
-        manager.initialize_with_options(node_id, initialize).await?;
+        for (_, result) in manager.initialize([(node_id, options)]).await {
+            result?;
+        }
         ensure_initialized(&manager, node_id)?;
 
         match action {
@@ -1157,7 +1159,9 @@ async fn verify_cleanup_fence(
 
 fn parse_tpdo1_rate(value: &str) -> anyhow::Result<PdoProfile> {
     // 速率是 1000/N Hz —— OD 里的 event timer 就是整毫秒，只有这些值可表达。
-    let hz: u32 = value.parse().map_err(|_| anyhow::anyhow!("TPDO1 rate must be a number, got {value}"))?;
+    let hz: u32 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("TPDO1 rate must be a number, got {value}"))?;
     if hz == 0 || 1000 % hz != 0 {
         anyhow::bail!("TPDO1 rate must divide 1000 (1000/500/250/200/125/100/…), got {value}");
     }

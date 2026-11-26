@@ -2,7 +2,7 @@
 //!
 //! 验证内容：
 //! - 电机被 `Cia402Manager` 自动发现并 `Identified`
-//! - `mgr.initialize(target)` 跑完整序列（NMT PreOp → 配 TPDO1+TPDO2 → 配 0x1016 → NMT Op）
+//! - `mgr.initialize([target])` 跑完整序列（NMT PreOp → 配 TPDO1+TPDO2 → 配 0x1016 → NMT Op）
 //! - 之后能在 0x180+nid 上看到周期 TPDO1 帧（默认 1 ms，12 字节）和 0x280+nid
 //!   上的 TPDO2 帧（默认 20 ms，10 字节）
 //! - `list()` 中 target 节点 lifecycle == `Initialized` 且 `online == true`
@@ -32,7 +32,9 @@ use hex_motor::cia402::{
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let iface = std::env::args().nth(1).unwrap_or_else(|| "vcan0".to_string());
+    let iface = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "vcan0".to_string());
     let our_nid: u8 = std::env::args()
         .nth(2)
         .map(|s| parse_u8(&s))
@@ -44,9 +46,7 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?
         .ok_or_else(|| anyhow::anyhow!("3rd arg required: target motor nid"))?;
 
-    println!(
-        "Opening {iface}\n  our HB nid=0x{our_nid:02X}\n  target motor nid=0x{target:02X}"
-    );
+    println!("Opening {iface}\n  our HB nid=0x{our_nid:02X}\n  target motor nid=0x{target:02X}");
 
     let bus: Arc<dyn CanBus> = common::open_bus(&iface).await?;
     let mgr = Cia402Manager::new(
@@ -89,7 +89,9 @@ async fn main() -> anyhow::Result<()> {
         r2.comm.event_timer_ms,
     );
     let t0 = Instant::now();
-    mgr.initialize(target).await?;
+    for (_, result) in mgr.initialize([target]).await {
+        result?;
+    }
     println!("  -> Initialized in {:?}", t0.elapsed());
 
     // ===== 3. 订阅 TPDO1 + TPDO2 看原始帧 & 周期 list() =====
@@ -175,16 +177,22 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn wait_for_identified(mgr: &Cia402Manager, nid: u8, timeout: Duration) -> anyhow::Result<()> {
+async fn wait_for_identified(
+    mgr: &Cia402Manager,
+    nid: u8,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     let mut events = mgr.subscribe_events();
 
     // 先看一眼 list（可能已经 Identified 了）
-    if mgr
-        .list()
-        .iter()
-        .any(|m| m.node_id == nid && matches!(m.lifecycle, MotorLifecycle::Identified | MotorLifecycle::NeedsReinit { .. }))
-    {
+    if mgr.list().iter().any(|m| {
+        m.node_id == nid
+            && matches!(
+                m.lifecycle,
+                MotorLifecycle::Identified | MotorLifecycle::NeedsReinit { .. }
+            )
+    }) {
         return Ok(());
     }
 
@@ -194,7 +202,9 @@ async fn wait_for_identified(mgr: &Cia402Manager, nid: u8, timeout: Duration) ->
             anyhow::bail!("timeout waiting for nid 0x{nid:02X} to be Identified");
         }
         match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Some(EventStreamItem::Event(Cia402Event::Identified { nid: n, .. }))) if n == nid => {
+            Ok(Some(EventStreamItem::Event(Cia402Event::Identified { nid: n, .. })))
+                if n == nid =>
+            {
                 return Ok(());
             }
             Ok(Some(_)) => continue,

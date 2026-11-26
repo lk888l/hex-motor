@@ -33,7 +33,9 @@ pub async fn open_bus(iface: &str) -> anyhow::Result<Arc<dyn CanBus>> {
 /// and the underscore-less `gsusb2` variants.
 fn gs_usb_channel(iface: &str) -> Option<u16> {
     let s = iface.trim().to_ascii_lowercase();
-    let rest = s.strip_prefix("gs_usb").or_else(|| s.strip_prefix("gsusb"))?;
+    let rest = s
+        .strip_prefix("gs_usb")
+        .or_else(|| s.strip_prefix("gsusb"))?;
     let rest = rest.strip_prefix(':').unwrap_or(rest);
     if rest.is_empty() {
         Some(0)

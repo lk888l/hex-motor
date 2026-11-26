@@ -44,13 +44,13 @@ use std::time::{Duration, Instant};
 use can_transport::CanBus;
 use tokio::sync::broadcast;
 
+use super::pdo_profile::PdoProfile;
 use crate::canopen::{
     heartbeat::encode_consumer_heartbeat_entry,
     nmt::{self, NmtCommand, NmtState},
     sdo,
     tpdo_config::{build_tpdo_config_writes, TpdoCommParams, TpdoEntry, TpdoRecipe},
 };
-use super::pdo_profile::PdoProfile;
 use crate::error::{Error, Result};
 use crate::types::MotorIdentity;
 
