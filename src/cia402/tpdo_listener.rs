@@ -361,10 +361,7 @@ mod tests {
     fn undecodable_frames_warn_once_then_stay_quiet() {
         let mut limiter = UndecodableWarnLimiter::default();
         assert!(limiter.should_warn(0x14, 1), "首次必须告警");
-        assert!(
-            !limiter.should_warn(0x14, 1),
-            "同一 (nid,tpdo) 立即重复应静默"
-        );
+        assert!(!limiter.should_warn(0x14, 1), "同一 (nid,tpdo) 立即重复应静默");
         assert!(limiter.should_warn(0x14, 2), "另一条 TPDO 独立计时");
         assert!(limiter.should_warn(0x15, 1), "另一个节点独立计时");
     }
@@ -404,4 +401,5 @@ mod tests {
             Ok(Cia402Event::NodeOnline { nid: 20 })
         ));
     }
+
 }

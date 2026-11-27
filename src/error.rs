@@ -40,7 +40,10 @@ pub enum Error {
     DeviceOperationRejected { nid: u8, reason: String },
 
     #[error("nid 0x{nid:02X} device operation timed out: {operation}")]
-    DeviceOperationTimeout { nid: u8, operation: &'static str },
+    DeviceOperationTimeout {
+        nid: u8,
+        operation: &'static str,
+    },
 
     #[error("internal: {0}")]
     Internal(String),

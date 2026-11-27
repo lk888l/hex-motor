@@ -345,8 +345,9 @@ CAN 配置（包含对象字典保存的 Node-ID），并缓存到 `MotorInfo::c
 
 ### 同一条总线上并行初始化多台 Meow Motor
 
-目标节点完成身份识别及 `0x2001` 读取后，可用 `initialize_many` 一次提交多个节点。
-下面的七台电机使用同一个 4 ms 的 TPDO1 周期。
+目标节点完成身份识别及 `0x2001` 读取后，可用 `MeowMotorManager::initialize_many`
+一次提交多个节点。每批必须显式传入一个 `PdoProfile`。下面七台电机的 TPDO1
+周期都是 4 ms，TPDO2 周期固定为 20 ms。
 
 ```rust
 use hex_motor::cia402::PdoProfile;
@@ -360,8 +361,37 @@ for (node_id, result) in manager.initialize_many(&nodes, profile).await {
 }
 ```
 
-每批最多同时初始化 8 台。同一节点的 SDO 顺序执行，不同节点可以同时等待心跳和
-PDO 反馈。每台成功的电机都已在 Operational 收到新的 TPDO1、TPDO2 并确认 Disabled。
-返回值按节点 ID 升序排列，每个 ID 一项。重复的 ID 直接报错，其余节点继续初始化。
-需要逐台指定共享 PDO 槽位或心跳选项时，可将 `(node_id, MeowMotorInitializeOptions)`
-列表传给 `initialize_many_with_options`。
+第一阶段最多 8 台同时进行身份复核、PreOperational 切换和 SDO 配置。整批配置结束后，
+第二阶段只启动配置成功的节点，并行等待各自的 Operational 心跳及随后的有效 TPDO1/2。
+确认模式为 Disabled 后，该节点进入 `Initialized`。两个批量入口均按节点 ID 升序
+返回结果，每个 ID 一项。重复的 ID 在发帧前检出，其余节点继续初始化。
+
+控制器配置共享 Host PDO 时，按载荷的槽位顺序传入电机，整组指定一个 `host_node_id`。
+下面两台电机分别使用槽位 0 和 1，共用同一套 MIT 映射。每台都可以选择自己的
+映射和心跳开关。开启开关会将 manager 的心跳节点写入该电机的 `0x1016:01`。
+
+```rust
+use hex_motor::cia402::PdoProfile;
+use hex_motor::meow_motor::{CompressedMitMapping, MeowMotorSharedPdoNode};
+
+let nodes = [0x05, 0x02].map(|node_id| MeowMotorSharedPdoNode {
+    node_id,
+    compressed_mit_mapping: CompressedMitMapping::default(),
+    configure_consumer_heartbeat: true,
+});
+let profile = PdoProfile::from_event_timer_ms(4)?;
+let host_node_id = 0x0A;
+let results = manager
+    .initialize_many_with_shared_pdo(&nodes, profile, host_node_id)
+    .await;
+for (node_id, result) in results {
+    if let Err(error) = result {
+        eprintln!("电机 0x{node_id:02X} 初始化失败：{error}");
+    }
+}
+```
+
+一组共享 Host PDO 最多容纳 8 台。整组长度和槽位由原始列表确定，某台失败时其他
+电机保留原槽位。单台初始化可用 `initialize(node_id, pdo_profile)` 或
+`initialize_with_options(node_id, options)`，两者均返回 `Result<()>`。重启一台
+电机后，可通过后者的 `SharedHostPdoConfig` 指定原来的槽位和整组长度。

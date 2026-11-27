@@ -34,9 +34,7 @@ use hex_motor::canopen::{
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let iface = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "vcan0".to_string());
+    let iface = std::env::args().nth(1).unwrap_or_else(|| "vcan0".to_string());
     let our_nid: u8 = std::env::args()
         .nth(2)
         .map(|s| parse_u8(&s))
@@ -93,8 +91,8 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(Duration::from_millis(period_ms));
             loop {
                 tick.tick().await;
-                let frame =
-                    build_heartbeat_frame(our_nid, NmtState::Operational).expect("build hb");
+                let frame = build_heartbeat_frame(our_nid, NmtState::Operational)
+                    .expect("build hb");
                 if let Err(e) = bus.send(frame).await {
                     log::warn!("发送心跳失败: {e}");
                 }

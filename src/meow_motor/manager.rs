@@ -5,13 +5,13 @@
 //! disabled, then call [`MeowMotorManager::identify`] only from the shared owner's serialized
 //! integration path. The per-node SDO registry is intentionally not a cross-manager mutex.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use can_transport::CanBus;
 use canopen_sdo::{asynch::AsyncSdoError, SdoAbortCode, SdoError};
-use futures::{stream, StreamExt};
+use futures::{future::join_all, stream, StreamExt};
 use tokio::sync::{broadcast, watch, MutexGuard};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -35,12 +35,13 @@ use super::commands::{
     MeowMotorTarget, MeowProfileLimits,
 };
 use super::discovery::{identify_and_cache, run_discovery, run_liveness_monitor};
-use super::entry::{MotorEntry, OperationRegistry};
+use super::entry::{MotorEntry, OperationGuard, OperationRegistry};
 use super::events::MeowMotorEvent;
 use super::identity::MeowMotorModel;
 use super::listener::run_tpdo_listener;
 use super::pdo::{
     compressed_mit_rpdo1_recipe, device_tpdo1_recipe, device_tpdo2_recipe, mode_rpdo2_recipe,
+    MAX_SHARED_PDO_MOTORS,
 };
 use super::settings::{build_settings_update_plan, read_from_device, MeowMotorCanSettings};
 use super::types::{
@@ -130,27 +131,13 @@ impl Default for MeowMotorInitializeOptions {
     }
 }
 
-/// One entry in a [`MeowMotorManager::initialize`] request.
-/// A node ID uses the default options. A `(node_id, options)` pair selects per-node settings.
+/// Per-motor settings for [`MeowMotorManager::initialize_many_with_shared_pdo`].
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MeowMotorInitializeTarget {
+pub struct MeowMotorSharedPdoNode {
     pub node_id: u8,
-    pub options: MeowMotorInitializeOptions,
-}
-
-impl From<u8> for MeowMotorInitializeTarget {
-    fn from(node_id: u8) -> Self {
-        Self {
-            node_id,
-            options: MeowMotorInitializeOptions::default(),
-        }
-    }
-}
-
-impl From<(u8, MeowMotorInitializeOptions)> for MeowMotorInitializeTarget {
-    fn from((node_id, options): (u8, MeowMotorInitializeOptions)) -> Self {
-        Self { node_id, options }
-    }
+    pub compressed_mit_mapping: CompressedMitMapping,
+    /// Write `0x1016:01` to consume the heartbeat from the manager's `heartbeat_node_id`.
+    pub configure_consumer_heartbeat: bool,
 }
 
 pub struct MeowMotorManager {
@@ -182,12 +169,16 @@ struct IdentityToken {
     serial_number: u32,
 }
 
-struct InitializationRollback<'a> {
-    entry: &'a MotorEntry,
-    token: &'a IdentityToken,
+/// Owns the node's exclusive operation across configuration, the batch barrier and feedback.
+struct PreparedInitialization {
+    entry: Arc<MotorEntry>,
+    token: IdentityToken,
+    _guard: OperationGuard,
+    peak_torque_nm: Option<f32>,
+    mit_kp_kd_factor: Option<f32>,
 }
 
-impl Drop for InitializationRollback<'_> {
+impl Drop for PreparedInitialization {
     fn drop(&mut self) {
         let mut inner = self.entry.inner.lock().unwrap();
         if inner.lifecycle == MeowMotorLifecycle::Initializing && self.token.matches_entry(&inner) {
@@ -350,94 +341,151 @@ impl MeowMotorManager {
         })
     }
 
-    /// Initializes the selected nodes, with up to eight in flight per call.
-    /// Pass an array, slice or vector of node IDs or `(node_id, options)` pairs.
-    /// A repeated node ID or a host PDO slot claimed by different nodes rejects every
-    /// affected node before it transmits. Other nodes proceed under their own SDO guards.
-    /// Returns one result per distinct node ID, in ascending order.
+    /// Initialize one motor with the given TPDO1 profile and consumer heartbeat enabled.
+    pub async fn initialize(&self, node_id: u8, pdo_profile: PdoProfile) -> Result<()> {
+        self.initialize_with_options(node_id, MeowMotorInitializeOptions::new(pdo_profile))
+            .await
+    }
+
+    /// Initialize one motor, optionally assigning a specific slot in an existing shared PDO.
+    pub async fn initialize_with_options(
+        &self,
+        node_id: u8,
+        options: MeowMotorInitializeOptions,
+    ) -> Result<()> {
+        let prepared = self.prepare_initialization(node_id, options).await?;
+        self.finish_initialization(prepared).await
+    }
+
+    /// Configure up to eight motors concurrently in PreOperational. Once configuration
+    /// finishes for the whole batch, start the prepared motors and confirm their feedback.
+    /// Returns one result per distinct node ID in ascending order. Duplicate IDs are
+    /// rejected before any initialization frames are sent to those motors.
     ///
     /// ```
-    /// use hex_motor::{cia402::PdoProfile, meow_motor::MeowMotorInitializeOptions};
+    /// use hex_motor::cia402::PdoProfile;
     /// # async fn example(manager: &hex_motor::meow_motor::MeowMotorManager) -> hex_motor::Result<()> {
-    /// for (_, result) in manager.initialize([1, 2]).await {
-    ///     result?;
-    /// }
-    ///
-    /// let options = MeowMotorInitializeOptions::new(PdoProfile::from_event_timer_ms(4)?);
-    /// let configs = vec![(3, options), (4, options)];
-    /// for (_, result) in manager.initialize(&configs).await {
+    /// let profile = PdoProfile::from_event_timer_ms(4)?;
+    /// for (_, result) in manager.initialize_many(&[1, 2], profile).await {
     ///     result?;
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn initialize<T>(&self, targets: impl AsRef<[T]>) -> Vec<(u8, Result<()>)>
-    where
-        T: Copy + Into<MeowMotorInitializeTarget>,
-    {
-        let mut requests = HashMap::new();
-        let mut slot_owners = HashMap::new();
-        for &target in targets.as_ref() {
-            let MeowMotorInitializeTarget { node_id, options } = target.into();
-            requests
-                .entry(node_id)
-                .and_modify(|request| {
-                    *request = Err(Error::DeviceOperationRejected {
-                        nid: node_id,
-                        reason: "duplicate node ID in initialization batch".into(),
-                    });
-                })
-                .or_insert(Ok(options));
+    pub async fn initialize_many(
+        &self,
+        nodes: &[u8],
+        pdo_profile: PdoProfile,
+    ) -> Vec<(u8, Result<()>)> {
+        let options = MeowMotorInitializeOptions::new(pdo_profile);
+        self.initialize_batch(nodes.iter().map(|&id| (id, options)))
+            .await
+    }
 
-            // Even a repeated ID may claim a slot also requested by another node.
-            let Some(host) = options.shared_host_pdo else {
-                continue;
-            };
-            let slot = (host.host_node_id, host.motor_slot);
-            let owner = *slot_owners.entry(slot).or_insert(node_id);
-            if owner == node_id {
-                continue;
-            }
-            for nid in [owner, node_id] {
-                if let Some(request @ Ok(_)) = requests.get_mut(&nid) {
-                    *request = Err(Error::DeviceOperationRejected {
+    /// Configure up to eight motors sharing one host's PDOs. Each motor's input position
+    /// sets its slot, including when another motor fails. Results follow the same ordering
+    /// and duplicate-ID rules as [`Self::initialize_many`].
+    /// An oversized group or a host node ID outside 1..=127 fails the entire group
+    /// before any initialization frames are sent.
+    pub async fn initialize_many_with_shared_pdo(
+        &self,
+        nodes: &[MeowMotorSharedPdoNode],
+        pdo_profile: PdoProfile,
+        host_node_id: u8,
+    ) -> Vec<(u8, Result<()>)> {
+        let group_error = if nodes.len() > usize::from(MAX_SHARED_PDO_MOTORS) {
+            Some(format!(
+                "shared PDO supports up to {MAX_SHARED_PDO_MOTORS} motors, got {}",
+                nodes.len()
+            ))
+        } else if !(1..=127).contains(&host_node_id) {
+            Some(format!("host node ID must be 1..=127, got {host_node_id}"))
+        } else {
+            None
+        };
+        if let Some(reason) = group_error {
+            let ids: BTreeSet<_> = nodes.iter().map(|node| node.node_id).collect();
+            return ids
+                .into_iter()
+                .map(|nid| {
+                    (
                         nid,
-                        reason: format!(
-                            "host 0x{:02X} PDO slot {} claimed by multiple nodes",
-                            host.host_node_id, host.motor_slot
-                        ),
-                    });
-                }
-            }
+                        Err(Error::DeviceOperationRejected {
+                            nid,
+                            reason: reason.clone(),
+                        }),
+                    )
+                })
+                .collect();
         }
 
-        let mut results: Vec<_> = stream::iter(requests)
+        let total_motors = nodes.len() as u8;
+        let requests = nodes.iter().enumerate().map(|(slot, node)| {
+            let options = MeowMotorInitializeOptions {
+                pdo_profile,
+                configure_consumer_heartbeat: node.configure_consumer_heartbeat,
+                shared_host_pdo: Some(SharedHostPdoConfig {
+                    host_node_id,
+                    motor_slot: slot as u8,
+                    total_motors,
+                    compressed_mit_mapping: node.compressed_mit_mapping,
+                }),
+            };
+            (node.node_id, options)
+        });
+        self.initialize_batch(requests).await
+    }
+
+    async fn initialize_batch(
+        &self,
+        targets: impl Iterator<Item = (u8, MeowMotorInitializeOptions)>,
+    ) -> Vec<(u8, Result<()>)> {
+        let mut requests = HashMap::new();
+        for (node_id, options) in targets {
+            requests
+                .entry(node_id)
+                .and_modify(|request| *request = None)
+                .or_insert(Some(options));
+        }
+
+        let prepared: Vec<_> = stream::iter(requests)
             .map(|(node_id, request)| async move {
                 let result = match request {
-                    Ok(options) => self.initialize_node(node_id, options).await,
-                    Err(error) => Err(error),
+                    Some(options) => self.prepare_initialization(node_id, options).await,
+                    None => Err(Error::DeviceOperationRejected {
+                        nid: node_id,
+                        reason: "duplicate node ID in initialization batch".into(),
+                    }),
                 };
                 (node_id, result)
             })
             .buffer_unordered(MAX_CONCURRENT_INITIALIZATIONS)
             .collect()
             .await;
+        // Wait for every PreOperational configuration before enabling any motor's TPDO traffic.
+        let mut results = join_all(prepared.into_iter().map(|(node_id, prepared)| async move {
+            let result = match prepared {
+                Ok(prepared) => self.finish_initialization(prepared).await,
+                Err(error) => Err(error),
+            };
+            (node_id, result)
+        }))
+        .await;
         results.sort_unstable_by_key(|(node_id, _)| *node_id);
         results
     }
 
-    /// Configures Device TPDO1/2 (and optional controller Host RPDO lanes), enters Operational,
-    /// waits for fresh valid feedback, and commits only when mode display is still Disabled.
-    async fn initialize_node(
+    async fn prepare_initialization(
         &self,
         node_id: u8,
         initialize_options: MeowMotorInitializeOptions,
-    ) -> Result<()> {
+    ) -> Result<PreparedInitialization> {
         let entry = self.require_exact_entry(node_id)?;
-        let _guard = self.operations.try_acquire(node_id, "initialize")?;
+        let guard = self.operations.try_acquire(node_id, "initialize")?;
         let token = self.identity_token(&entry)?;
         {
             let mut inner = entry.inner.lock().unwrap();
+            self.ensure_identity_token_inner(node_id, &inner, &token)?;
             if !matches!(
                 inner.lifecycle,
                 MeowMotorLifecycle::Identified | MeowMotorLifecycle::NeedsReinit { .. }
@@ -460,25 +508,19 @@ impl MeowMotorManager {
             entry.publish(live);
         }
 
-        // Roll back on errors and on cancellation before releasing the per-node SDO guard.
-        let _rollback = InitializationRollback {
-            entry: &entry,
-            token: &token,
+        let mut prepared = PreparedInitialization {
+            entry,
+            token,
+            _guard: guard,
+            peak_torque_nm: None,
+            mit_kp_kd_factor: None,
         };
-        self.run_initialize(&entry, &token, initialize_options)
-            .await
-    }
-
-    async fn run_initialize(
-        &self,
-        entry: &Arc<MotorEntry>,
-        token: &IdentityToken,
-        initialize_options: MeowMotorInitializeOptions,
-    ) -> Result<()> {
-        let node_id = entry.node_id;
+        let entry = &prepared.entry;
+        let token = &prepared.token;
         self.verify_identity_on_wire(entry, token).await?;
         self.send_nmt_and_wait(
             entry,
+            token,
             NmtCommand::EnterPreOperational,
             NmtState::PreOperational,
         )
@@ -536,7 +578,7 @@ impl MeowMotorManager {
                 .await?;
         }
 
-        let peak_torque_nm = sdo::upload_f32(
+        prepared.peak_torque_nm = sdo::upload_f32(
             self.bus.as_ref(),
             node_id,
             0x4576,
@@ -545,7 +587,7 @@ impl MeowMotorManager {
         )
         .await
         .ok();
-        let mit_kp_kd_factor = sdo::upload_f32(
+        prepared.mit_kp_kd_factor = sdo::upload_f32(
             self.bus.as_ref(),
             node_id,
             0x4102,
@@ -555,46 +597,78 @@ impl MeowMotorManager {
         .await
         .ok();
         self.ensure_identity_token(entry, token)?;
+        Ok(prepared)
+    }
+
+    async fn finish_initialization(&self, prepared: PreparedInitialization) -> Result<()> {
+        let entry = &prepared.entry;
+        let token = &prepared.token;
+        let node_id = entry.node_id;
         {
-            let mut inner = entry.inner.lock().unwrap();
-            inner.peak_torque_nm = peak_torque_nm;
-            inner.mit_kp_kd_factor = mit_kp_kd_factor;
+            let inner = entry.inner.lock().unwrap();
+            self.ensure_identity_token_inner(node_id, &inner, token)?;
+            if !inner.online || inner.nmt_state != Some(NmtState::PreOperational) {
+                return Err(Error::DeviceOperationRejected {
+                    nid: node_id,
+                    reason: "node left Pre-Operational before initialization could finish".into(),
+                });
+            }
         }
 
-        self.send_nmt_and_wait(entry, NmtCommand::StartRemoteNode, NmtState::Operational)
-            .await?;
-        // Fence after Operational heartbeat confirmation, so Pre-Operational PDOs cannot
-        // satisfy initialization readiness.
-        let (tpdo1_baseline, tpdo2_baseline) = {
-            let inner = entry.inner.lock().unwrap();
-            (
-                inner.measurements.tpdo1_generation,
-                inner.measurements.tpdo2_generation,
+        let operational_revision = self
+            .send_nmt_and_wait(
+                entry,
+                token,
+                NmtCommand::StartRemoteNode,
+                NmtState::Operational,
             )
-        };
-        self.wait_for_initial_feedback(entry, token, tpdo1_baseline, tpdo2_baseline)
             .await?;
 
-        let live = {
-            let mut inner = entry.inner.lock().unwrap();
-            self.ensure_identity_token_inner(node_id, &inner, token)?;
-            if inner.nmt_state != Some(NmtState::Operational) {
-                return Err(Error::DeviceOperationRejected {
-                    nid: node_id,
-                    reason: "node left Operational before initialization commit".into(),
-                });
+        // Discovery records the generations at the Operational transition, so first PDOs
+        // that arrived while this future was waking already count.
+        let deadline = Instant::now() + self.options.mode_confirm_timeout;
+        let live = loop {
+            let notified = entry.notify.notified();
+            {
+                let mut inner = entry.inner.lock().unwrap();
+                self.ensure_identity_token_inner(node_id, &inner, token)?;
+                if inner.nmt_revision != operational_revision {
+                    return Err(Error::DeviceOperationRejected {
+                        nid: node_id,
+                        reason: "node left Operational before initialization commit".into(),
+                    });
+                }
+                let (tpdo1_baseline, tpdo2_baseline) = inner.nmt_tpdo_baseline;
+                if inner.measurements.tpdo1_generation != tpdo1_baseline
+                    && inner.measurements.tpdo2_generation != tpdo2_baseline
+                {
+                    match inner.logic {
+                        Some(MeowMotorLogic::Disabled) => {}
+                        Some(MeowMotorLogic::Error {
+                            mode_display,
+                            detailed_error,
+                        }) => {
+                            return Err(Error::DeviceOperationRejected {
+                                nid: node_id,
+                                reason: format!(
+                                    "initial feedback reports error mode=0x{mode_display:02X}, detail=0x{detailed_error:04X}"
+                                ),
+                            });
+                        }
+                        other => {
+                            return Err(Error::DeviceOperationRejected {
+                                nid: node_id,
+                                reason: format!("initial feedback is not Disabled: {other:?}"),
+                            });
+                        }
+                    }
+                    inner.peak_torque_nm = prepared.peak_torque_nm;
+                    inner.mit_kp_kd_factor = prepared.mit_kp_kd_factor;
+                    inner.lifecycle = MeowMotorLifecycle::Initialized;
+                    break inner.build_live_state(Instant::now());
+                }
             }
-            if inner.logic != Some(MeowMotorLogic::Disabled) {
-                return Err(Error::DeviceOperationRejected {
-                    nid: node_id,
-                    reason: format!(
-                        "initialization must finish Disabled, observed {:?}",
-                        inner.logic
-                    ),
-                });
-            }
-            inner.lifecycle = MeowMotorLifecycle::Initialized;
-            inner.build_live_state(Instant::now())
+            wait_notified(node_id, "initial TPDO1/TPDO2", deadline, notified).await?;
         };
         entry.publish(live);
         let _ = self.events.send(MeowMotorEvent::Initialized { node_id });
@@ -1192,9 +1266,10 @@ impl MeowMotorManager {
     async fn send_nmt_and_wait(
         &self,
         entry: &Arc<MotorEntry>,
+        token: &IdentityToken,
         command: NmtCommand,
         expected: NmtState,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let baseline = entry.inner.lock().unwrap().heartbeat_generation;
         self.bus
             .send(nmt::build_nmt_command(command, entry.node_id)?)
@@ -1204,53 +1279,12 @@ impl MeowMotorManager {
             let notified = entry.notify.notified();
             {
                 let inner = entry.inner.lock().unwrap();
+                self.ensure_identity_token_inner(entry.node_id, &inner, token)?;
                 if inner.heartbeat_generation != baseline && inner.nmt_state == Some(expected) {
-                    return Ok(());
+                    return Ok(inner.nmt_revision);
                 }
             }
             wait_notified(entry.node_id, "NMT confirmation", deadline, notified).await?;
-        }
-    }
-
-    async fn wait_for_initial_feedback(
-        &self,
-        entry: &Arc<MotorEntry>,
-        token: &IdentityToken,
-        tpdo1_baseline: u64,
-        tpdo2_baseline: u64,
-    ) -> Result<()> {
-        let deadline = Instant::now() + self.options.mode_confirm_timeout;
-        loop {
-            let notified = entry.notify.notified();
-            {
-                let inner = entry.inner.lock().unwrap();
-                self.ensure_identity_token_inner(entry.node_id, &inner, token)?;
-                if inner.measurements.tpdo1_generation != tpdo1_baseline
-                    && inner.measurements.tpdo2_generation != tpdo2_baseline
-                {
-                    match inner.logic {
-                        Some(MeowMotorLogic::Disabled) => return Ok(()),
-                        Some(MeowMotorLogic::Error {
-                            mode_display,
-                            detailed_error,
-                        }) => {
-                            return Err(Error::DeviceOperationRejected {
-                                nid: entry.node_id,
-                                reason: format!(
-                                    "initial feedback reports error mode=0x{mode_display:02X}, detail=0x{detailed_error:04X}"
-                                ),
-                            })
-                        }
-                        other => {
-                            return Err(Error::DeviceOperationRejected {
-                                nid: entry.node_id,
-                                reason: format!("initial feedback is not Disabled: {other:?}"),
-                            })
-                        }
-                    }
-                }
-            }
-            wait_notified(entry.node_id, "initial TPDO1/TPDO2", deadline, notified).await?;
         }
     }
 
@@ -1940,7 +1974,8 @@ mod tests {
     async fn batch_replaces_completed_node_and_cancel_allows_retry_in_the_same_session() {
         let node_ids: Vec<u8> = (1..=9).collect();
         let (manager, bus) = manager_with_identified_nodes(&node_ids);
-        let mut batch = Box::pin(manager.initialize(node_ids.as_slice()));
+        let profile = PdoProfile::from_event_timer_ms(4).unwrap();
+        let mut batch = Box::pin(manager.initialize_many(&node_ids, profile));
         assert!(futures::poll!(&mut batch).is_pending());
         assert_eq!(bus.requests.lock().unwrap().len(), 8);
 
@@ -1959,8 +1994,8 @@ mod tests {
         assert_eq!(running.len(), 8);
         let retry_id = running[0];
         assert!(matches!(
-            manager.initialize([retry_id]).await.as_slice(),
-            [(id, Err(Error::DeviceOperationRejected { .. }))] if *id == retry_id
+            manager.initialize(retry_id, profile).await,
+            Err(Error::DeviceOperationRejected { nid, .. }) if nid == retry_id
         ));
 
         let rebooted_id = running[1];
@@ -1981,63 +2016,76 @@ mod tests {
             assert_eq!(info.lifecycle, expected);
         }
 
-        let mut retry = Box::pin(manager.initialize([retry_id]));
+        let options = MeowMotorInitializeOptions::new(profile);
+        let mut retry = Box::pin(manager.initialize_with_options(retry_id, options));
         assert!(futures::poll!(&mut retry).is_pending());
         assert_eq!(&bus.requests.lock().unwrap()[9..], &[retry_id]);
         bus.release.add_permits(1);
-        assert!(matches!(retry.await.as_slice(), [(id, Err(Error::Sdo(_)))] if *id == retry_id));
+        assert!(matches!(retry.await, Err(Error::Sdo(_))));
         assert_eq!(
             manager.status(retry_id).unwrap().lifecycle,
             MeowMotorLifecycle::Identified
         );
     }
 
-    #[tokio::test]
-    async fn preflight_rejects_all_conflicts_before_sending_and_keeps_independent_nodes() {
-        let (manager, bus) = manager_with_identified_nodes(&[1, 4, 5, 6, 7, 8, 9]);
-        assert!(manager.initialize(Vec::<u8>::new()).await.is_empty());
-        assert!(bus.requests.lock().unwrap().is_empty());
+    fn shared_node(node_id: u8) -> MeowMotorSharedPdoNode {
+        MeowMotorSharedPdoNode {
+            node_id,
+            compressed_mit_mapping: CompressedMitMapping::default(),
+            configure_consumer_heartbeat: true,
+        }
+    }
 
-        let options = |host_node_id, motor_slot| MeowMotorInitializeOptions {
-            shared_host_pdo: Some(SharedHostPdoConfig {
-                host_node_id,
-                motor_slot,
-                total_motors: 2,
-                compressed_mit_mapping: CompressedMitMapping::default(),
-            }),
-            ..Default::default()
-        };
-        let configs = vec![
-            (5, options(21, 1)),
-            (1, options(21, 1)),
-            (4, options(10, 0)),
-            (7, options(10, 0)),
-            (5, options(22, 0)),
-            (9, options(22, 0)),
-            (8, options(11, 0)),
-            (6, options(12, 0)),
-            (99, MeowMotorInitializeOptions::default()),
-        ];
-        // 5 is repeated; both its original slot and its second slot are also claimed by peers.
-        // 6 and 8 have the same slot on different hosts and must both reach the bus.
-        bus.release.add_permits(configs.len());
-        let results = manager.initialize(&configs).await;
-        let mut sent = bus.requests.lock().unwrap().clone();
-        sent.sort_unstable();
-        assert_eq!(sent, [6, 8]);
-        assert!(matches!(
-            results.as_slice(),
-            [
-                (1, Err(Error::DeviceOperationRejected { .. })),
-                (4, Err(Error::DeviceOperationRejected { .. })),
-                (5, Err(Error::DeviceOperationRejected { .. })),
-                (6, Err(Error::Sdo(_))),
-                (7, Err(Error::DeviceOperationRejected { .. })),
-                (8, Err(Error::Sdo(_))),
-                (9, Err(Error::DeviceOperationRejected { .. })),
-                (99, Err(Error::UnknownNode(99))),
-            ]
-        ));
+    #[tokio::test]
+    async fn duplicate_ids_never_transmit_and_other_nodes_proceed() {
+        let (manager, bus) = manager_with_identified_nodes(&[1, 3]);
+        let profile = PdoProfile::from_event_timer_ms(4).unwrap();
+        assert!(manager.initialize_many(&[], profile).await.is_empty());
+        let node_ids = [3, 1, 3, 99];
+        let shared = node_ids.map(shared_node);
+        bus.release.add_permits(2 * node_ids.len());
+        let plain_results = manager.initialize_many(&node_ids, profile).await;
+        let shared_results = manager
+            .initialize_many_with_shared_pdo(&shared, profile, 10)
+            .await;
+        for results in [plain_results, shared_results] {
+            assert!(matches!(
+                results.as_slice(),
+                [
+                    (1, Err(Error::Sdo(_))),
+                    (3, Err(Error::DeviceOperationRejected { .. })),
+                    (99, Err(Error::UnknownNode(99))),
+                ]
+            ));
+        }
+        assert_eq!(*bus.requests.lock().unwrap(), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn shared_pdo_group_preflights_host_and_eight_slot_limit() {
+        let node_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let (manager, bus) = manager_with_identified_nodes(&node_ids);
+        let profile = PdoProfile::from_event_timer_ms(4).unwrap();
+        let nodes = node_ids.map(shared_node);
+        bus.release.add_permits(32);
+        for (group, host) in [(&nodes[..], 10), (&nodes[..8], 0), (&nodes[..8], 128)] {
+            let results = manager
+                .initialize_many_with_shared_pdo(group, profile, host)
+                .await;
+            assert_eq!(results.len(), group.len());
+            assert!(results.iter().all(|(_, result)| result.is_err()));
+            assert!(bus.requests.lock().unwrap().is_empty());
+        }
+        let results = manager
+            .initialize_many_with_shared_pdo(&nodes[..8], profile, 10)
+            .await;
+        assert_eq!(results.len(), 8);
+        assert!(results
+            .iter()
+            .all(|(_, result)| matches!(result, Err(Error::Sdo(_)))));
+        let mut started = bus.requests.lock().unwrap().clone();
+        started.sort_unstable();
+        assert_eq!(started, node_ids[..8]);
     }
 
     #[test]

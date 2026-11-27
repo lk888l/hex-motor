@@ -75,9 +75,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n=== Waiting for nid 0x{target:02X} to be Identified ===");
     wait_for_identified(&mgr, target, Duration::from_secs(10)).await?;
     println!("=== Initialize ===");
-    for (_, result) in mgr.initialize([target]).await {
-        result?;
-    }
+    mgr.initialize(target).await?;
     println!("  -> Initialized");
 
     // 读一下缓存的峰值力矩（Torque 模式把 Nm 目标换算成 ‰ 要用；这里也用它把

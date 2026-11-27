@@ -31,16 +31,14 @@ use std::time::Duration;
 use can_transport::CanBus;
 mod common;
 use hex_motor::cia402::{
-    Cia402Event, Cia402Manager, Cia402ManagerOptions, EventStreamItem, MotorInfo,
+    Cia402Manager, Cia402ManagerOptions, Cia402Event, EventStreamItem, MotorInfo,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let iface = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "vcan0".to_string());
+    let iface = std::env::args().nth(1).unwrap_or_else(|| "vcan0".to_string());
     let our_nid: u8 = std::env::args()
         .nth(2)
         .map(|s| parse_u8(&s))

@@ -43,6 +43,8 @@ pub(crate) struct MotorEntryInner {
     pub session_epoch: u64,
     pub heartbeat_generation: u64,
     pub nmt_revision: u64,
+    /// TPDO1/2 generations observed when the heartbeat last changed NMT state.
+    pub nmt_tpdo_baseline: (u64, u64),
     pub identify_attempted: bool,
     pub identity: Option<MotorIdentity>,
     pub model: Option<MeowMotorModel>,
@@ -74,6 +76,7 @@ impl MotorEntry {
                 session_epoch: 0,
                 heartbeat_generation: 0,
                 nmt_revision: 0,
+                nmt_tpdo_baseline: (0, 0),
                 identify_attempted: false,
                 identity: None,
                 model: None,
@@ -151,6 +154,7 @@ impl MotorEntryInner {
         self.last_tpdo1 = None;
         self.last_tpdo2 = None;
         self.nmt_state = None;
+        self.nmt_tpdo_baseline = (0, 0);
         self.logic = None;
         self.measurements = MeowMotorMeasurements::default();
         self.peak_torque_nm = None;

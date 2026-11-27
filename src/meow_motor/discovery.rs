@@ -211,6 +211,10 @@ fn handle_heartbeat(
         inner.heartbeat_generation = inner.heartbeat_generation.wrapping_add(1);
         if inner.nmt_state != Some(state) {
             inner.nmt_revision = inner.nmt_revision.wrapping_add(1);
+            inner.nmt_tpdo_baseline = (
+                inner.measurements.tpdo1_generation,
+                inner.measurements.tpdo2_generation,
+            );
         }
         inner.nmt_state = Some(state);
 

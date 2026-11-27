@@ -4,11 +4,11 @@
 //! - 构造启动 4 个常驻 task：HB 广播 / HB 监听 (discovery + auto-identify) /
 //!   TPDO 监听 (更新 last_tpdo) / 在线状态监控
 //! - `list()` / `subscribe_events()` / `identify(nid)`
-//! - `initialize([nid])` / `initialize([a, b])`
+//! - `initialize(nid)` / `initialize_all()`
 //!
 //! M4+ 会在此基础上叠加 `set_mode()` / `set_target()` 等。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -25,8 +25,8 @@ use crate::canopen::sdo;
 use crate::canopen::tpdo_config::SdoWrite;
 use crate::error::{Error, Result};
 use crate::types::{
-    DeviceCanConfig, DeviceCanConfigStatus, DeviceSettingsResult, DeviceSettingsUpdate,
-    MotorIdentity, MotorMode, MotorTarget,
+    DeviceCanConfig, DeviceCanConfigStatus, DeviceSettingsResult, DeviceSettingsUpdate, MotorMode,
+    MotorIdentity, MotorTarget,
 };
 
 use super::device_can::{
@@ -42,8 +42,8 @@ use super::known_devices;
 use super::motor_entry::MotorEntry;
 use super::pdo_profile::PdoProfile;
 use super::sequences::{
-    build_clear_error_writes, build_disable_writes, build_set_mode_writes, build_set_target_writes,
-    SetTargetContext, INTER_WRITE_DELAY,
+    build_clear_error_writes, build_disable_writes, build_set_mode_writes,
+    build_set_target_writes, SetTargetContext, INTER_WRITE_DELAY,
 };
 use super::subscribe::{StatusStream, StreamOptions, Subscriber};
 use super::tpdo_listener::run_tpdo_listener;
@@ -210,7 +210,7 @@ impl Cia402Manager {
             cancel.clone(),
         )));
         let velocity_window_ns = Arc::new(AtomicU64::new(
-            opts.pdo_profile.velocity_window().as_nanos() as u64,
+            opts.pdo_profile.velocity_window().as_nanos() as u64
         ));
         tasks.push(tokio::spawn(run_tpdo_listener(
             bus.clone(),
@@ -242,10 +242,7 @@ impl Cia402Manager {
 
     /// 本总线当前生效的 PDO 节拍：冻结过就是冻结值，否则是构造期默认值。
     pub fn pdo_profile(&self) -> PdoProfile {
-        self.pdo_profile
-            .get()
-            .copied()
-            .unwrap_or(self.opts.pdo_profile)
+        self.pdo_profile.get().copied().unwrap_or(self.opts.pdo_profile)
     }
 
     /// 冻结本总线的 PDO 节拍。**必须在第一个 `initialize()` 之前调用一次。**
@@ -368,53 +365,18 @@ impl Cia402Manager {
         Ok(())
     }
 
-    /// 并发初始化调用方选定的 CiA402 节点，每台使用本 manager 的 PDO 节拍。
+    /// 跑完整的初始化流程：NMT PreOp → 配 TPDO1 → 配 0x1016 → NMT Op。
+    /// 见 [`crate::cia402::initialize::run_initialize`] 和 `DESIGN.md` §6。
     ///
-    /// 单台传 `[nid]`，多台可传数组、切片或 `Vec<u8>`。结果按节点 ID 升序排列。
-    /// 同批重复的 ID 只返回一项错误，该节点不会收到初始化命令。其余节点独立执行。
-    /// 调用前可使用 [`list`](Self::list) 按设备身份选择本协议的电机。
-    ///
-    /// 单台操作与该节点上的识别及配置互斥。请先等待识别完成或调用 [`identify`](Self::identify)。
-    /// 已知型号须满足 [`known_devices::check_revision`] 的最低固件版本要求。
-    /// 失败时驱动回退初始化状态以便重试，设备可能已写入部分 PDO 配置。
-    ///
-    /// ```no_run
-    /// # use hex_motor::{cia402::Cia402Manager, Result};
-    /// # async fn example(manager: &Cia402Manager, id: u8, other_ids: &[u8]) -> Result<()> {
-    /// for (_, result) in manager.initialize([id]).await {
-    ///     result?;
-    /// }
-    /// for (node_id, result) in manager.initialize(other_ids).await {
-    ///     if let Err(error) = result {
-    ///         eprintln!("节点 {node_id} 初始化失败：{error}");
-    ///     }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn initialize(&self, node_ids: impl AsRef<[u8]>) -> Vec<(u8, Result<()>)> {
-        let mut duplicates = BTreeMap::new();
-        for &nid in node_ids.as_ref() {
-            duplicates
-                .entry(nid)
-                .and_modify(|repeated| *repeated = true)
-                .or_insert(false);
-        }
-        join_all(duplicates.into_iter().map(|(nid, repeated)| async move {
-            let result = if repeated {
-                Err(device_operation_rejected(
-                    nid,
-                    "duplicate node ID in initialization batch",
-                ))
-            } else {
-                self.initialize_node(nid).await
-            };
-            (nid, result)
-        }))
-        .await
-    }
-
-    async fn initialize_node(&self, nid: u8) -> Result<()> {
+    /// - 节点必须已 `Identified`（lifecycle == Identified 或 NeedsReinit）。
+    ///   `Unknown` 节点会先返回 [`crate::error::Error::NotReady`]，调用方应先
+    ///   等 `Identified` 事件或手动 `identify()`。
+    /// - 与 identify / 其他 initialize 互斥。
+    /// - 失败时 lifecycle 退回 `Identified`（identity 已知）/ `Unknown`，
+    ///   电机端可能残留部分 TPDO 配置（v0.1 不主动撤销）；调用方可直接重试。
+    /// - 已知型号但 `0x1018:03` 低于 [`known_devices::check_revision`] 要求的，
+    ///   在发出任何 SDO 之前就拒绝：旧版对象字典与本驱动不兼容，重试没有意义。
+    pub async fn initialize(&self, nid: u8) -> Result<()> {
         let entry = {
             let g = self.motors.read().unwrap();
             g.get(&nid).cloned().ok_or_else(|| {
@@ -541,6 +503,33 @@ impl Cia402Manager {
         }
     }
 
+    /// 对所有 `Identified` / `NeedsReinit` 节点**并发**跑 `initialize`。
+    /// 返回 `(nid, Result)` 列表，按 nid 升序。
+    pub async fn initialize_all(&self) -> Vec<(u8, Result<()>)> {
+        let targets: Vec<u8> = {
+            let g = self.motors.read().unwrap();
+            let mut v: Vec<u8> = g
+                .iter()
+                .filter_map(|(nid, e)| {
+                    let inner = e.inner.lock().unwrap();
+                    matches!(
+                        inner.lifecycle,
+                        MotorLifecycle::Identified | MotorLifecycle::NeedsReinit { .. }
+                    )
+                    .then_some(*nid)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+
+        let futures = targets.into_iter().map(|nid| async move {
+            let r = self.initialize(nid).await;
+            (nid, r)
+        });
+        join_all(futures).await
+    }
+
     /// 切换电机的控制模式（M4）。
     ///
     /// 内部跑 `sequences::build_set_mode_writes` 给出的 CiA402 状态机 ramp：
@@ -654,7 +643,12 @@ impl Cia402Manager {
         expected_product_code: u32,
         update: DeviceSettingsUpdate,
     ) -> Result<DeviceSettingsResult> {
-        self.validate_settings_target(nid, expected_vendor_id, expected_product_code, update)?;
+        self.validate_settings_target(
+            nid,
+            expected_vendor_id,
+            expected_product_code,
+            update,
+        )?;
         let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "apply_device_settings")?;
         let (entry, session) = self.require_current_session_online(nid, true)?;
         self.verify_identity_tuple_in_session(
@@ -696,7 +690,12 @@ impl Cia402Manager {
     pub async fn change_node_id(&self, nid: u8, new_id: u8) -> Result<()> {
         let (expected_vendor_id, expected_product_code) =
             self.cached_supported_identity_tuple(nid)?;
-        self.validate_node_id_target(nid, expected_vendor_id, expected_product_code, new_id)?;
+        self.validate_node_id_target(
+            nid,
+            expected_vendor_id,
+            expected_product_code,
+            new_id,
+        )?;
 
         let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "change_node_id")?;
         let (entry, session) = self.require_current_session_online(nid, true)?;
@@ -891,7 +890,8 @@ impl Cia402Manager {
     /// 兼容旧调用方的按需位置读取；未知设备不会收到任何位置对象访问。
     pub async fn read_position(&self, nid: u8) -> Result<f32> {
         let (vendor_id, product_code) = self.cached_motor_identity_tuple(nid)?;
-        self.read_position_for(nid, vendor_id, product_code).await
+        self.read_position_for(nid, vendor_id, product_code)
+            .await
     }
 
     /// 写 `0x6072`（Max Torque），限制**所有模式**下的最大力矩输出。
@@ -973,9 +973,7 @@ impl Cia402Manager {
     /// 你会先看到 connection 字段在变，等 TPDO 配好后才有 measurements / logic。
     pub fn subscribe_status(&self, nid: u8, opts: StreamOptions) -> Result<StatusStream> {
         if opts.capacity == 0 {
-            return Err(Error::Internal(
-                "subscribe_status: capacity must be > 0".into(),
-            ));
+            return Err(Error::Internal("subscribe_status: capacity must be > 0".into()));
         }
         let entry = self
             .motors
@@ -1112,7 +1110,10 @@ impl Cia402Manager {
             ));
         }
         if let Some(data_bitrate) = update.data_bitrate {
-            if !matches!(data_bitrate, 1_000_000 | 2_000_000 | 4_000_000 | 5_000_000) {
+            if !matches!(
+                data_bitrate,
+                1_000_000 | 2_000_000 | 4_000_000 | 5_000_000
+            ) {
                 return Err(device_operation_rejected(
                     nid,
                     format!(
@@ -1156,7 +1157,9 @@ impl Cia402Manager {
         if new_node_id == self.opts.heartbeat_node_id {
             return Err(device_operation_rejected(
                 nid,
-                format!("new node ID {new_node_id} conflicts with the manager heartbeat node ID"),
+                format!(
+                    "new node ID {new_node_id} conflicts with the manager heartbeat node ID"
+                ),
             ));
         }
         validate_role_node_id(vendor_id, product_code, new_node_id)
@@ -1216,7 +1219,9 @@ impl Cia402Manager {
             }
             Err(error) => Err(device_operation_rejected(
                 nid,
-                format!("could not safely prove target node ID {new_node_id} is free: {error}"),
+                format!(
+                    "could not safely prove target node ID {new_node_id} is free: {error}"
+                ),
             )),
         }
     }
@@ -1317,12 +1322,28 @@ impl Cia402Manager {
         expected_product_code: u32,
     ) -> Result<()> {
         let timeout = Some(self.opts.sdo_timeout);
-        self.ensure_device_session(nid, entry, session, require_configuration_nmt_state)?;
-        let actual_vendor_id = sdo::upload_u32(self.bus.as_ref(), nid, 0x1018, 1, timeout).await?;
-        self.ensure_device_session(nid, entry, session, require_configuration_nmt_state)?;
+        self.ensure_device_session(
+            nid,
+            entry,
+            session,
+            require_configuration_nmt_state,
+        )?;
+        let actual_vendor_id =
+            sdo::upload_u32(self.bus.as_ref(), nid, 0x1018, 1, timeout).await?;
+        self.ensure_device_session(
+            nid,
+            entry,
+            session,
+            require_configuration_nmt_state,
+        )?;
         let actual_product_code =
             sdo::upload_u32(self.bus.as_ref(), nid, 0x1018, 2, timeout).await?;
-        self.ensure_device_session(nid, entry, session, require_configuration_nmt_state)?;
+        self.ensure_device_session(
+            nid,
+            entry,
+            session,
+            require_configuration_nmt_state,
+        )?;
         if actual_vendor_id != expected_vendor_id || actual_product_code != expected_product_code {
             return Err(device_operation_rejected(
                 nid,
@@ -1418,10 +1439,13 @@ impl Cia402Manager {
     /// 拿到 lifecycle == Initialized 的 entry，否则返回 NotReady。
     fn require_initialized(&self, nid: u8) -> Result<Arc<MotorEntry>> {
         let g = self.motors.read().unwrap();
-        let entry = g.get(&nid).cloned().ok_or_else(|| Error::NotReady {
-            nid,
-            lifecycle: "not in list".into(),
-        })?;
+        let entry = g
+            .get(&nid)
+            .cloned()
+            .ok_or_else(|| Error::NotReady {
+                nid,
+                lifecycle: "not in list".into(),
+            })?;
         drop(g);
         let inner = entry.inner.lock().unwrap();
         if !matches!(inner.lifecycle, MotorLifecycle::Initialized) {
@@ -1467,7 +1491,12 @@ impl Cia402Manager {
         let sdo_timeout = Some(self.opts.sdo_timeout);
         let last = writes.len().saturating_sub(1);
         for (i, write) in writes.iter().enumerate() {
-            self.ensure_device_session(nid, entry, session, require_configuration_nmt_state)?;
+            self.ensure_device_session(
+                nid,
+                entry,
+                session,
+                require_configuration_nmt_state,
+            )?;
             sdo::download(
                 self.bus.as_ref(),
                 nid,
@@ -1477,12 +1506,22 @@ impl Cia402Manager {
                 sdo_timeout,
             )
             .await?;
-            self.ensure_device_session(nid, entry, session, require_configuration_nmt_state)?;
+            self.ensure_device_session(
+                nid,
+                entry,
+                session,
+                require_configuration_nmt_state,
+            )?;
             if i != last {
                 tokio::time::sleep(INTER_WRITE_DELAY).await;
             }
         }
-        self.ensure_device_session(nid, entry, session, require_configuration_nmt_state)
+        self.ensure_device_session(
+            nid,
+            entry,
+            session,
+            require_configuration_nmt_state,
+        )
     }
 }
 
@@ -1631,7 +1670,9 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use can_transport::{CanCapabilities, CanFilter, CanFrame, CanId, CanIoError, CanRx};
+    use can_transport::{
+        CanCapabilities, CanFilter, CanFrame, CanId, CanIoError, CanRx,
+    };
     use tokio::sync::mpsc;
 
     const MOTOR_VENDOR: u32 = 0x4859_444C;
@@ -1689,9 +1730,14 @@ mod tests {
             inner.online = true;
             inner.nmt_state = Some(NmtState::PreOperational);
         }
-        let error = wait_for_reset_communication_bootup(&entry, 3, 2, Duration::from_millis(15))
-            .await
-            .unwrap_err();
+        let error = wait_for_reset_communication_bootup(
+            &entry,
+            3,
+            2,
+            Duration::from_millis(15),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, Error::DeviceOperationTimeout { .. }));
 
         // Boot-Up 即使已经快速过渡为 Pre-Operational，revision 仍会保留证据。
@@ -1702,9 +1748,14 @@ mod tests {
             inner.nmt_state = Some(NmtState::PreOperational);
         }
         assert_eq!(
-            wait_for_reset_communication_bootup(&entry, 4, 2, Duration::from_millis(20),)
-                .await
-                .unwrap(),
+            wait_for_reset_communication_bootup(
+                &entry,
+                4,
+                2,
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap(),
             5
         );
     }
@@ -1727,7 +1778,6 @@ mod tests {
         requests: Mutex<Vec<RecordedSdo>>,
         response_tx: Mutex<Option<mpsc::UnboundedSender<CanFrame>>>,
         send_hook: Mutex<Option<SendHook>>,
-        nmt_tx: Option<mpsc::UnboundedSender<(u8, u8)>>,
     }
 
     impl ScriptedSettingsBus {
@@ -1742,18 +1792,11 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 response_tx: Mutex::new(None),
                 send_hook: Mutex::new(None),
-                nmt_tx: None,
             }
         }
 
         fn requests(&self) -> Vec<RecordedSdo> {
             self.requests.lock().unwrap().clone()
-        }
-
-        fn capture_nmt(mut self) -> (Arc<Self>, mpsc::UnboundedReceiver<(u8, u8)>) {
-            let (tx, rx) = mpsc::unbounded_channel();
-            self.nmt_tx = Some(tx);
-            (Arc::new(self), rx)
         }
 
         fn set_send_hook(&self, hook: SendHook) {
@@ -1773,16 +1816,6 @@ mod tests {
     impl CanBus for ScriptedSettingsBus {
         async fn send(&self, frame: CanFrame) -> std::result::Result<(), CanIoError> {
             let request = frame.data();
-            if frame.id() == CanId::Standard(0) {
-                if let [command, nid] = request {
-                    return self
-                        .nmt_tx
-                        .as_ref()
-                        .ok_or(CanIoError::Disconnected)?
-                        .send((*nid, *command))
-                        .map_err(|_| CanIoError::Disconnected);
-                }
-            }
             if request.len() != 8 {
                 return Err(CanIoError::backend(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1909,7 +1942,7 @@ mod tests {
             ..Default::default()
         };
         let velocity_window_ns = Arc::new(AtomicU64::new(
-            opts.pdo_profile.velocity_window().as_nanos() as u64,
+            opts.pdo_profile.velocity_window().as_nanos() as u64
         ));
         Cia402Manager {
             bus,
@@ -1952,109 +1985,6 @@ mod tests {
 
     fn entry(manager: &Cia402Manager, nid: u8) -> Arc<MotorEntry> {
         manager.motors.read().unwrap()[&nid].clone()
-    }
-
-    fn add_initializable_node(manager: &Cia402Manager, nid: u8) -> Arc<MotorEntry> {
-        add_online_entry(manager, nid, MOTOR_VENDOR, MOTOR_PRODUCT, NmtState::Stopped);
-        let entry = entry(manager, nid);
-        entry
-            .inner
-            .lock()
-            .unwrap()
-            .identity
-            .as_mut()
-            .unwrap()
-            .revision_number = known_devices::MIN_REVISION_0X4859444C;
-        entry
-    }
-
-    #[tokio::test]
-    async fn initialize_starts_all_nine_nodes_and_cancellation_allows_retry() {
-        let (bus, mut nmt) = ScriptedSettingsBus::new([]).capture_nmt();
-        let manager = test_manager(bus);
-        let ids: Vec<u8> = (1..=9).collect();
-        for &nid in &ids {
-            add_initializable_node(&manager, nid);
-        }
-        assert!(manager.initialize([]).await.is_empty());
-        assert!(nmt.try_recv().is_err());
-
-        // Keep all nine waiting for their first Pre-Operational heartbeat.
-        let mut batch = Box::pin(manager.initialize(ids.clone()));
-        assert!(futures::poll!(&mut batch).is_pending());
-        let mut started = Vec::new();
-        while let Ok((nid, command)) = nmt.try_recv() {
-            assert_eq!(command, NmtCommand::EnterPreOperational as u8);
-            started.push(nid);
-        }
-        started.sort_unstable();
-        assert_eq!(started, ids);
-        drop(batch);
-        assert!(manager
-            .list()
-            .iter()
-            .all(|info| info.lifecycle == MotorLifecycle::Identified));
-        let mut retry = Box::pin(manager.initialize([9]));
-        assert!(futures::poll!(&mut retry).is_pending());
-        assert_eq!(
-            nmt.try_recv().unwrap(),
-            (9, NmtCommand::EnterPreOperational as u8)
-        );
-    }
-
-    #[tokio::test]
-    async fn initialize_completes_selected_node_alongside_duplicate_and_revision_errors() {
-        let (bus, mut nmt) = ScriptedSettingsBus::new([
-            ((1, 0x6041, 0), vec![0x0040u16.to_le_bytes().to_vec()]),
-            ((1, 0x6076, 0), vec![1.0f32.to_le_bytes().to_vec()]),
-            ((1, 0x2003, 7), vec![1.0f32.to_le_bytes().to_vec()]),
-            ((1, 0x603F, 0), vec![0u16.to_le_bytes().to_vec()]),
-        ])
-        .capture_nmt();
-        let manager = test_manager(bus);
-        let healthy = add_initializable_node(&manager, 1);
-        add_initializable_node(&manager, 2); // repeated in batch
-        add_online_entry(&manager, 3, MOTOR_VENDOR, MOTOR_PRODUCT, NmtState::Stopped);
-        add_initializable_node(&manager, 4); // discovered, omitted from batch
-        let device_feedback = async {
-            for (command, state) in [
-                (NmtCommand::EnterPreOperational, NmtState::PreOperational),
-                (NmtCommand::StartRemoteNode, NmtState::Operational),
-            ] {
-                assert_eq!(nmt.recv().await.unwrap(), (1, command as u8));
-                let mut inner = healthy.inner.lock().unwrap();
-                inner.nmt_state = Some(state);
-                inner.nmt_revision += 1;
-            }
-            loop {
-                {
-                    let mut inner = healthy.inner.lock().unwrap();
-                    inner.last_heartbeat = Some(Instant::now());
-                    inner.measurements.status_word = Some(0x0040);
-                    inner.logic = Some(Logic::Disabled);
-                    inner.tpdo2_revision += 1;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-        let ids = [3, 2, 1, 2];
-        let results = tokio::select! {
-            results = manager.initialize(ids.as_slice()) => results,
-            () = device_feedback => unreachable!(),
-        };
-        assert!(
-            matches!(results.as_slice(), [
-            (1, Ok(())),
-            (2, Err(Error::DeviceOperationRejected { reason: duplicate, .. })),
-            (3, Err(Error::DeviceOperationRejected { reason: revision, .. })),
-        ] if duplicate.contains("duplicate") && revision.contains("revision")),
-            "{results:?}"
-        );
-        assert_eq!(
-            healthy.inner.lock().unwrap().lifecycle,
-            MotorLifecycle::Initialized
-        );
-        assert!(nmt.try_recv().is_err(), "unexpected initialization command");
     }
 
     #[tokio::test]
@@ -2101,13 +2031,7 @@ mod tests {
         // 这条是本次改动最重要的护栏：晚到的冻结不会有任何症状 —— 已配好的电机
         // 继续按旧节拍发，新配的按新节拍发，同一条线上跑出两种速率，带宽预算失效。
         let manager = test_manager(Arc::new(ScriptedSettingsBus::new([])));
-        add_online_entry(
-            &manager,
-            1,
-            MOTOR_VENDOR,
-            MOTOR_PRODUCT,
-            NmtState::PreOperational,
-        );
+        add_online_entry(&manager, 1, MOTOR_VENDOR, MOTOR_PRODUCT, NmtState::PreOperational);
         entry(&manager, 1).inner.lock().unwrap().lifecycle = MotorLifecycle::Initialized;
 
         let error = manager
@@ -2152,20 +2076,27 @@ mod tests {
         assert_eq!(recipe.comm.transmission_type, 255);
         assert_eq!(recipe.cob_id, 0x195);
         // 映射不能被节拍影响 —— 只有通信参数跟着走。
-        assert_eq!(
-            recipe.entries,
-            super::super::initialize::DEFAULT_TPDO1_ENTRIES.to_vec()
-        );
+        assert_eq!(recipe.entries, super::super::initialize::DEFAULT_TPDO1_ENTRIES.to_vec());
     }
 
-    fn motor_settings_values(node_id: u8, data_bitrate: u32, brs: bool) -> [ScriptedValue; 8] {
+    fn motor_settings_values(
+        node_id: u8,
+        data_bitrate: u32,
+        brs: bool,
+    ) -> [ScriptedValue; 8] {
         [
             ((1, 0x1018, 1), vec![MOTOR_VENDOR.to_le_bytes().to_vec()]),
             ((1, 0x1018, 2), vec![MOTOR_PRODUCT.to_le_bytes().to_vec()]),
             ((1, 0x2001, 0), vec![vec![4]]),
             ((1, 0x2001, 1), vec![vec![node_id]]),
-            ((1, 0x2001, 2), vec![1_000_000u32.to_le_bytes().to_vec()]),
-            ((1, 0x2001, 3), vec![data_bitrate.to_le_bytes().to_vec()]),
+            (
+                (1, 0x2001, 2),
+                vec![1_000_000u32.to_le_bytes().to_vec()],
+            ),
+            (
+                (1, 0x2001, 3),
+                vec![data_bitrate.to_le_bytes().to_vec()],
+            ),
             ((1, 0x2001, 4), vec![vec![u8::from(brs)]]),
             ((42, 0x1018, 1), vec![]),
         ]
@@ -2186,10 +2117,10 @@ mod tests {
             NmtState::PreOperational,
         );
 
-        let results = manager.initialize([1]).await;
-        let [(1, Err(error))] = results.as_slice() else {
-            panic!("an outdated object dictionary must not be initialized: {results:?}");
-        };
+        let error = manager
+            .initialize(1)
+            .await
+            .expect_err("an outdated object dictionary must not be initialized");
         let text = error.to_string();
         assert!(text.contains("revision 0"), "{text}");
         assert!(text.contains(">= 8"), "{text}");
@@ -2462,8 +2393,14 @@ mod tests {
             ((31, 0x1018, 2), vec![PRODUCT.to_le_bytes().to_vec()]),
             ((31, 0x2100, 0), vec![vec![3]]),
             ((31, 0x2101, 0), vec![vec![31]]),
-            ((31, 0x2100, 1), vec![1_000_000u32.to_le_bytes().to_vec()]),
-            ((31, 0x2100, 2), vec![4_000_000u32.to_le_bytes().to_vec()]),
+            (
+                (31, 0x2100, 1),
+                vec![1_000_000u32.to_le_bytes().to_vec()],
+            ),
+            (
+                (31, 0x2100, 2),
+                vec![4_000_000u32.to_le_bytes().to_vec()],
+            ),
             ((31, 0x2100, 3), vec![vec![1]]),
         ]));
         let manager = test_manager(bus.clone());
@@ -2567,10 +2504,19 @@ mod tests {
     async fn identity_mismatch_aborts_before_config_probe_or_write() {
         let bus = Arc::new(ScriptedSettingsBus::new([
             ((1, 0x1018, 1), vec![MOTOR_VENDOR.to_le_bytes().to_vec()]),
-            ((1, 0x1018, 2), vec![0xAAAA_0002u32.to_le_bytes().to_vec()]),
+            (
+                (1, 0x1018, 2),
+                vec![0xAAAA_0002u32.to_le_bytes().to_vec()],
+            ),
         ]));
         let manager = test_manager(bus.clone());
-        add_online_entry(&manager, 1, MOTOR_VENDOR, MOTOR_PRODUCT, NmtState::Stopped);
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::Stopped,
+        );
 
         let error = manager
             .apply_device_settings(

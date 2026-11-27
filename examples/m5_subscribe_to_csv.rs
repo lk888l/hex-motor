@@ -1,7 +1,7 @@
 //! M5 真机自测：订阅一台电机的 `LiveState` 流，边跑 ProfileVelocity 边录 CSV。
 //!
 //! 流程（叠加在 M4 之上）：
-//! 1. 自动 identify → `mgr.initialize([target])` 配 TPDO1+TPDO2 → NMT Operational
+//! 1. 自动 identify → `mgr.initialize(target)` 配 TPDO1+TPDO2 → NMT Operational
 //! 2. `mgr.set_mode(target, ProfileVelocity)` + `mgr.set_target(Velocity)` 把电机转起来
 //! 3. **`mgr.status(target)`** 拿一次无锁快照打印（验证 ArcSwap fast path）
 //! 4. **`mgr.subscribe_status(target, …)`** 拿一个 stream，逐条写 CSV
@@ -99,9 +99,7 @@ async fn main() -> anyhow::Result<()> {
     // ===== 2. Initialize =====
     println!("\n=== Initialize ===");
     let t0 = Instant::now();
-    for (_, result) in mgr.initialize([target]).await {
-        result?;
-    }
+    mgr.initialize(target).await?;
     println!("  -> Initialized in {:?}", t0.elapsed());
 
     // ===== 3. set_mode + set_target =====

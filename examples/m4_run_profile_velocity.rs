@@ -2,7 +2,7 @@
 //!
 //! 流程（和 `m3_initialize_and_read` 是叠加关系）：
 //! 1. 等到 target 被 `Cia402Manager` 自动 identify。
-//! 2. `mgr.initialize([target])` 把 TPDO1+TPDO2 配好，进 NMT Operational。
+//! 2. `mgr.initialize(target)` 把 TPDO1+TPDO2 配好，进 NMT Operational。
 //! 3. `mgr.set_mode(target, ProfileVelocity)` 走 CiA402 ramp 并等 TPDO2 反馈
 //!    `Logic::Enabled(ProfileVelocity)`。
 //! 4. `mgr.set_target(target, Velocity { rev_per_s })` 写一次 `0x60FF`。
@@ -39,9 +39,7 @@ use hex_motor::types::{MotorMode, MotorTarget};
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let iface = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "vcan0".to_string());
+    let iface = std::env::args().nth(1).unwrap_or_else(|| "vcan0".to_string());
     let our_nid: u8 = std::env::args()
         .nth(2)
         .map(|s| parse_u8(&s))
@@ -76,35 +74,25 @@ async fn main() -> anyhow::Result<()> {
     println!("\n=== Waiting for nid 0x{target:02X} to be Identified ===");
     wait_for_identified(&mgr, target, Duration::from_secs(10)).await?;
     {
-        let m = mgr
-            .list()
-            .into_iter()
-            .find(|m| m.node_id == target)
-            .unwrap();
+        let m = mgr.list().into_iter().find(|m| m.node_id == target).unwrap();
         println!("Identified: {} ({:?})", m.friendly_name(), m.identity);
     }
 
     // ===== 2. Initialize =====
     println!("\n=== Initialize ===");
     let t0 = Instant::now();
-    for (_, result) in mgr.initialize([target]).await {
-        result?;
-    }
+    mgr.initialize(target).await?;
     println!("  -> Initialized in {:?}", t0.elapsed());
 
     // ===== 3. set_mode(ProfileVelocity) + 等 TPDO 反馈 =====
     println!("\n=== set_mode(ProfileVelocity) ===");
     let t0 = Instant::now();
     mgr.set_mode(target, MotorMode::ProfileVelocity).await?;
-    println!(
-        "  -> Enabled(ProfileVelocity) confirmed in {:?}",
-        t0.elapsed()
-    );
+    println!("  -> Enabled(ProfileVelocity) confirmed in {:?}", t0.elapsed());
 
     // ===== 4. set_target(Velocity) =====
     println!("\n=== set_target(Velocity {{ rev_per_s = {rev_per_s:.3} }}) ===");
-    mgr.set_target(target, MotorTarget::Velocity { rev_per_s })
-        .await?;
+    mgr.set_target(target, MotorTarget::Velocity { rev_per_s }).await?;
     println!("  -> 0x60FF written");
 
     // ===== 5. 周期打印 + 监听事件 =====
@@ -160,22 +148,16 @@ fn print_status(mgr: &Cia402Manager, nid: u8) {
     );
 }
 
-async fn wait_for_identified(
-    mgr: &Cia402Manager,
-    nid: u8,
-    timeout: Duration,
-) -> anyhow::Result<()> {
+async fn wait_for_identified(mgr: &Cia402Manager, nid: u8, timeout: Duration) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     let mut events = mgr.subscribe_events();
 
     // 先看一眼 list（可能已经 Identified 了）
-    if mgr.list().iter().any(|m| {
-        m.node_id == nid
-            && matches!(
-                m.lifecycle,
-                MotorLifecycle::Identified | MotorLifecycle::NeedsReinit { .. }
-            )
-    }) {
+    if mgr
+        .list()
+        .iter()
+        .any(|m| m.node_id == nid && matches!(m.lifecycle, MotorLifecycle::Identified | MotorLifecycle::NeedsReinit { .. }))
+    {
         return Ok(());
     }
 
@@ -185,9 +167,7 @@ async fn wait_for_identified(
             anyhow::bail!("timeout waiting for nid 0x{nid:02X} to be Identified");
         }
         match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Some(EventStreamItem::Event(Cia402Event::Identified { nid: n, .. })))
-                if n == nid =>
-            {
+            Ok(Some(EventStreamItem::Event(Cia402Event::Identified { nid: n, .. }))) if n == nid => {
                 return Ok(());
             }
             Ok(Some(_)) => continue,

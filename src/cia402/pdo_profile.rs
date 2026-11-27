@@ -179,11 +179,7 @@ mod tests {
     #[test]
     fn derived_rates_cover_the_controller_policy_table() {
         // 控制器的判据表只会产生这三档；派生值必须跟着一起缩放。
-        for (ms, hz, inhibit, window_ms) in [
-            (1u16, 1000.0, 5u16, 15u64),
-            (2, 500.0, 15, 30),
-            (4, 250.0, 35, 60),
-        ] {
+        for (ms, hz, inhibit, window_ms) in [(1u16, 1000.0, 5u16, 15u64), (2, 500.0, 15, 30), (4, 250.0, 35, 60)] {
             let p = PdoProfile::from_event_timer_ms(ms).unwrap();
             assert_eq!(p.hz(), hz);
             assert_eq!(p.inhibit_time_x100us(), inhibit, "inhibit @ {ms}ms");
@@ -218,16 +214,8 @@ mod tests {
     #[test]
     fn overrides_are_validated_against_the_period() {
         let p = PdoProfile::from_event_timer_ms(4).unwrap();
-        assert_eq!(
-            p.with_inhibit_time_x100us(40)
-                .unwrap()
-                .inhibit_time_x100us(),
-            40
-        );
-        assert!(
-            p.with_inhibit_time_x100us(41).is_err(),
-            "inhibit > 周期必须拒绝"
-        );
+        assert_eq!(p.with_inhibit_time_x100us(40).unwrap().inhibit_time_x100us(), 40);
+        assert!(p.with_inhibit_time_x100us(41).is_err(), "inhibit > 周期必须拒绝");
         assert!(p.with_velocity_window(Duration::ZERO).is_err());
         assert_eq!(
             p.with_velocity_window(Duration::from_millis(80))

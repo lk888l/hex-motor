@@ -7,6 +7,9 @@ use crate::canopen::tpdo_config::{TpdoCommParams, TpdoEntry, TpdoRecipe};
 use crate::cia402::PdoProfile;
 use crate::error::{Error, Result};
 
+// A 64-byte Host TPDO1 carries one 8-byte compressed MIT lane per motor.
+pub(super) const MAX_SHARED_PDO_MOTORS: u8 = 8;
+
 const TPDO1_ENTRIES: [TpdoEntry; 3] = [
     TpdoEntry {
         index: 0x4564,
@@ -85,9 +88,9 @@ fn validate_node_id(node_id: u8, role: &'static str) -> Result<()> {
 }
 
 fn validate_slot(slot: u8, total: u8) -> Result<()> {
-    if total == 0 || total > 8 {
+    if total == 0 || total > MAX_SHARED_PDO_MOTORS {
         return Err(Error::Internal(format!(
-            "shared PDO slot count must be 1..=8, got {total}"
+            "shared PDO slot count must be 1..={MAX_SHARED_PDO_MOTORS}, got {total}"
         )));
     }
     if slot >= total {
@@ -212,8 +215,8 @@ mod tests {
     fn device_tpdo1_is_exactly_eight_bytes_at_every_rate() {
         // 载荷宽度与节拍无关：降频只改通信参数，不改映射，否则解码器要跟着变。
         for ms in [1u16, 2, 4] {
-            let recipe =
-                device_tpdo1_recipe(10, PdoProfile::from_event_timer_ms(ms).unwrap()).unwrap();
+            let recipe = device_tpdo1_recipe(10, PdoProfile::from_event_timer_ms(ms).unwrap())
+                .unwrap();
             assert_eq!(recipe.total_bytes(), 8, "payload width @ {ms}ms");
             assert_eq!(recipe.entries, TPDO1_ENTRIES);
             assert_eq!(recipe.comm.event_timer_ms, ms);
